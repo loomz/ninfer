@@ -1157,6 +1157,116 @@ int test_constrained_decoding() {
     return failures;
 }
 
+int test_custom_tool_lowering() {
+    // A top-level custom tool is accepted, lowered to a function the Engine can call, and tracked
+    // so the response re-emits a `custom_tool_call` Item with a raw `input` string.
+    const Json body = {{"model", "m"},
+                       {"input", "list the files"},
+                       {"tools",
+                        Json::array({Json{{"type", "custom"},
+                                           {"name", "shell"},
+                                           {"input_schema", Json{{"type", "object"}}}}})}};
+    const OpenAIResponsesCreateRequest request =
+        parse_openai_responses_create_request(body, limits());
+    int failures = 0;
+    failures += check(request.prompt.generation.tools.size() == 1 &&
+                          request.prompt.generation.tools[0].name == "shell" &&
+                          request.custom_tool_engine_names.contains("shell"),
+                      "a top-level custom tool is lowered to a function and tracked");
+    failures += check(request.tools[0].at("type") == "custom" &&
+                          request.tools[0].contains("input_schema") &&
+                          !request.tools[0].contains("parameters"),
+                      "the custom tool echoes back with input_schema, not parameters");
+
+    GenerationOutcome outcome = sample_outcome();
+    outcome.text.clear();
+    outcome.reasoning.clear();
+    outcome.tool_calls.push_back(
+        ninfer::GeneratedToolCall{.name = "shell", .arguments_json = R"({"command":"ls"})"});
+    OpenAIResponsesRuntimeValues runtime;
+    const BuiltOpenAIResponse built =
+        make_openai_response_object("resp_custom", 123, request, runtime, outcome);
+    const Json& item = built.body.at("output").at(0);
+    failures += check(item.at("type") == "custom_tool_call" && item.at("input") == R"({"command":"ls"})",
+                      "a custom tool call is emitted as a custom_tool_call Item with raw input");
+
+    // Multi-turn history: an assistant custom_tool_call followed by its custom_tool_call_output.
+    const Json history = {{"model", "m"},
+                          {"input",
+                           Json::array({Json{{"type", "message"}, {"role", "user"}, {"content", "list"}},
+                                        Json{{"type", "custom_tool_call"},
+                                             {"call_id", "call_s1"},
+                                             {"name", "shell"},
+                                             {"input", R"({"command":"ls"})"},
+                                             {"status", "completed"}},
+                                        Json{{"type", "custom_tool_call_output"},
+                                             {"call_id", "call_s1"},
+                                             {"output", "README.md"},
+                                             {"status", "completed"}}})}};
+    const OpenAIResponsesCreateRequest replayed =
+        parse_openai_responses_create_request(history, limits());
+    failures += check(replayed.prompt.input_turns.back().role == ninfer::ChatRole::Tool &&
+                          replayed.prompt.input_turns.back().tool_call_id == "call_s1",
+                      "a custom_tool_call_output is lowered to a Tool turn in model history");
+    return failures;
+}
+
+int test_client_side_tool_passthrough() {
+    // Codex-style request: a custom free-form tool carrying a client-only `format` grammar, plus
+    // two nameless client-side tools (`web_search`, `tool_search`) identified only by `type`.
+    // All are accepted: the custom tool lowers to a tracked function; the client tools lower to
+    // callable functions and round-trip verbatim. A soft `text.verbosity` hint is ignored.
+    const Json body = Json::parse(R"({
+        "model": "m",
+        "input": "hello",
+        "text": {"verbosity": "low"},
+        "include": ["reasoning.encrypted_content"],
+        "tools": [
+            {"type": "custom", "name": "apply_patch", "description": "edit files",
+             "format": {"type": "grammar", "syntax": "lark", "definition": "start: \"x\""}},
+            {"type": "web_search", "external_web_access": false},
+            {"type": "tool_search", "execution": "client",
+             "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}}
+        ]
+    })");
+    const OpenAIResponsesCreateRequest request =
+        parse_openai_responses_create_request(body, limits());
+    int failures = 0;
+    failures += check(request.prompt.generation.tools.size() == 3 &&
+                          request.prompt.generation.tools[0].name == "apply_patch" &&
+                          request.prompt.generation.tools[1].name == "web_search" &&
+                          request.prompt.generation.tools[2].name == "tool_search",
+                      "custom and nameless client tools lower to Engine functions by name/type");
+    failures += check(request.custom_tool_engine_names.contains("apply_patch"),
+                      "the custom tool stays tracked for custom_tool_call re-emission");
+    failures += check(request.tools[1].at("type") == "web_search" &&
+                          request.tools[1].at("external_web_access") == false &&
+                          !request.tools[1].contains("parameters"),
+                      "a nameless client tool round-trips verbatim without invented members");
+    failures += check(request.tools[2].at("execution") == "client" &&
+                          request.tools[2].at("parameters").at("properties").contains("query"),
+                      "a client tool's parameters are lowered and echoed");
+    failures += check(!request.tools[0].contains("format"),
+                      "a custom tool's client-only format member is ignored, not echoed");
+    // Verbosity is a soft hint: the accepted `low` above proves the enum round-trips, and an
+    // unknown value is still rejected.
+    failures += check(api_code([&] {
+                          Json bad = body;
+                          bad["text"]["verbosity"] = "bogus";
+                          (void)parse_openai_responses_create_request(bad, limits());
+                      }) == "verbosity_not_supported",
+                      "an unknown text.verbosity is still rejected");
+    // A non-empty `include` is accepted (the unavailable fields are omitted), but malformed
+    // entries are still rejected.
+    failures += check(api_code([&] {
+                          Json bad = body;
+                          bad["include"] = Json::array({Json("reasoning.encrypted_content"), 7});
+                          (void)parse_openai_responses_create_request(bad, limits());
+                      }) == "invalid_type",
+                      "a non-string include entry is rejected");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -1174,6 +1284,8 @@ int main() {
     failures += test_explicit_rejections();
     failures += test_previous_response_call_graph();
     failures += test_response_object();
+    failures += test_custom_tool_lowering();
+    failures += test_client_side_tool_passthrough();
     failures += test_sse_sequence_and_failures();
     failures += test_input_tokens_uses_shared_state_path();
     if (failures == 0) { std::cout << "ok\n"; }

@@ -520,6 +520,91 @@ ChatTurn parse_function_call_output_item(
     return turn;
 }
 
+// A custom_tool_call Input Item is the assistant side of a prior custom-tool invocation. It is
+// lowered to the same ToolCall the Engine uses for functions: the free-form `input` string is kept
+// verbatim as `arguments_json` (no object requirement, custom inputs may be plain strings).
+ToolCall parse_custom_tool_call_item(const Json& item, Json& canonical,
+                                     std::unordered_map<std::string,
+                                                       OpenAIResponsesFunctionIdentity>& identities) {
+    static const std::unordered_set<std::string> allowed = {
+        "id", "type", "call_id", "name", "input", "status", "namespace"};
+    reject_nonnull_unknown_members(item, allowed, "input");
+    if (!item.contains("call_id") || !item.at("call_id").is_string() ||
+        item.at("call_id").get_ref<const std::string&>().empty()) {
+        bad_request("custom_tool_call must contain a non-empty call_id", "input");
+    }
+    ToolCall call;
+    call.id                                        = item.at("call_id").get<std::string>();
+    const OpenAIResponsesFunctionIdentity identity = function_identity(item, "input");
+    call.name = lower_function_identity(identity, identities, "input");
+    if (!item.contains("input") || !item.at("input").is_string()) {
+        bad_request("custom_tool_call input must be a string", "input");
+    }
+    call.arguments_json = item.at("input").get<std::string>();
+    if (item.contains("status") && !item.at("status").is_null() &&
+        (!item.at("status").is_string() || item.at("status").get<std::string>() != "completed")) {
+        bad_request("partial custom_tool_call Items cannot be represented in model history", "input",
+                    "partial_tool_call_not_supported");
+    }
+    canonical = {{"id", item_id(item, "ctc")},
+                 {"type", "custom_tool_call"},
+                 {"status", "completed"},
+                 {"call_id", call.id},
+                 {"input", call.arguments_json}};
+    add_wire_function_identity(canonical, identity);
+    return call;
+}
+
+// A custom_tool_call_output Input Item carries a custom tool's result. Like shell/file tools it
+// produces a plain string; content arrays are not needed for the supported custom tools.
+ChatTurn parse_custom_tool_call_output_item(
+    const Json& item, Json& canonical, std::size_t& breakpoint_count,
+    std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities) {
+    static const std::unordered_set<std::string> allowed = {
+        "id", "type", "call_id", "output", "status", "name", "namespace"};
+    reject_nonnull_unknown_members(item, allowed, "input");
+    if (!item.contains("call_id") || !item.at("call_id").is_string() ||
+        item.at("call_id").get_ref<const std::string&>().empty()) {
+        bad_request("custom_tool_call_output must contain a non-empty call_id", "input");
+    }
+    if (!item.contains("output")) {
+        bad_request("custom_tool_call_output must contain output", "input");
+    }
+    if (item.contains("status") && !item.at("status").is_null() &&
+        (!item.at("status").is_string() || item.at("status").get<std::string>() != "completed")) {
+        bad_request("partial custom_tool_call_output Items cannot be represented in model history",
+                    "input", "partial_tool_result_not_supported");
+    }
+
+    ChatTurn turn;
+    turn.role                = ChatRole::Tool;
+    turn.tool_call_id        = item.at("call_id").get<std::string>();
+    const bool has_name      = item.contains("name") && !item.at("name").is_null();
+    const bool has_namespace = item.contains("namespace") && !item.at("namespace").is_null();
+    if (has_namespace && !has_name) {
+        bad_request("custom_tool_call_output.namespace requires custom_tool_call_output.name",
+                    "input", "invalid_tool_history");
+    }
+    std::optional<OpenAIResponsesFunctionIdentity> asserted_identity;
+    if (has_name) {
+        asserted_identity     = function_identity(item, "input");
+        turn.tool_result_name = lower_function_identity(*asserted_identity, identities, "input");
+    }
+    if (!item.at("output").is_string()) {
+        bad_request("custom_tool_call_output output must be a string", "input");
+    }
+    turn.content.push_back(tool_output_text(item.at("output").get<std::string>(), nullptr,
+                                            breakpoint_count));
+
+    canonical = {{"id", item_id(item, "ctco")},
+                 {"type", "custom_tool_call_output"},
+                 {"status", "completed"},
+                 {"call_id", turn.tool_call_id},
+                 {"output", item.at("output")}};
+    if (asserted_identity) { add_wire_function_identity(canonical, *asserted_identity); }
+    return turn;
+}
+
 enum class AssistantInputPhase {
     Empty,
     Reasoning,
@@ -640,6 +725,13 @@ void parse_input(const Json& input, OpenAIResponsesPromptRequest& out,
                 parse_function_call_output_item(item, canonical, breakpoint_count, identities);
             assistant.flush(out.input_turns);
             out.input_turns.push_back(std::move(result));
+        } else if (type == "custom_tool_call") {
+            assistant.append_call(parse_custom_tool_call_item(item, canonical, identities));
+        } else if (type == "custom_tool_call_output") {
+            ChatTurn result =
+                parse_custom_tool_call_output_item(item, canonical, breakpoint_count, identities);
+            assistant.flush(out.input_turns);
+            out.input_turns.push_back(std::move(result));
         } else if (type == "input_file") {
             bad_request("input_file requires a Files API, which NInfer does not provide", "input",
                         "file_inputs_not_supported");
@@ -660,6 +752,7 @@ struct ParsedPromptFields {
     Json wire_tool_choice    = "auto";
     bool parallel_tool_calls = true;
     std::unordered_map<std::string, OpenAIResponsesFunctionIdentity> tool_identities;
+    std::unordered_set<std::string> custom_tool_names;
 };
 
 struct ParsedFunctionTool {
@@ -672,10 +765,13 @@ ParsedFunctionTool
 parse_function_tool(const Json& item, std::optional<std::string> wire_namespace,
                     std::string_view namespace_description,
                     std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities,
-                    std::string schema_param) {
+                    std::string schema_param,
+                    bool is_custom = false) {
     static const std::unordered_set<std::string> allowed_members = {
-        "type",          "name",         "description", "parameters", "strict", "allowed_callers",
-        "defer_loading", "output_schema"};
+        "type",          "name",         "description", "parameters", "input_schema", "strict",
+        "allowed_callers", "defer_loading", "output_schema", "format"};
+    // `format` carries a client-side grammar (e.g. Codex `apply_patch` Lark) the Engine does not
+    // enforce; it is accepted and ignored like the other opaque members.
     reject_nonnull_unknown_members(item, allowed_members, "tools");
 
     const OpenAIResponsesFunctionIdentity identity{.name = require_function_name(item, "tools"),
@@ -702,7 +798,16 @@ parse_function_tool(const Json& item, std::optional<std::string> wire_namespace,
     }
 
     Json parameters = Json{{"type", "object"}, {"properties", Json::object()}};
-    if (item.contains("parameters") && !item.at("parameters").is_null()) {
+    if (is_custom) {
+        // Custom tools describe their input with `input_schema`; the Engine lowers it to the
+        // function parameter schema. A custom tool without one keeps the empty-object default.
+        if (item.contains("input_schema") && !item.at("input_schema").is_null()) {
+            if (!item.at("input_schema").is_object()) {
+                bad_request("custom tool input_schema must be a JSON object", "tools");
+            }
+            parameters = item.at("input_schema");
+        }
+    } else if (item.contains("parameters") && !item.at("parameters").is_null()) {
         if (!item.at("parameters").is_object()) {
             bad_request("function parameters must be a JSON object", "tools");
         }
@@ -746,10 +851,17 @@ parse_function_tool(const Json& item, std::optional<std::string> wire_namespace,
     }
 
     parsed.definition.input_schema_json = parameters.dump();
-    parsed.canonical                    = {{"type", "function"},
-                                           {"name", identity.name},
-                                           {"parameters", parameters},
-                                           {"strict", parsed.definition.strict}};
+    if (is_custom) {
+        // Echo the custom tool faithfully: `input_schema` is the wire field, not `parameters`.
+        parsed.canonical = {{"type", "custom"},
+                            {"name", identity.name},
+                            {"input_schema", parameters}};
+    } else {
+        parsed.canonical = {{"type", "function"},
+                            {"name", identity.name},
+                            {"parameters", parameters},
+                            {"strict", parsed.definition.strict}};
+    }
     if (!function_description.empty()) {
         parsed.canonical["description"] = std::move(function_description);
     }
@@ -790,10 +902,62 @@ void parse_tools(const Json& body, ParsedPromptFields& out) {
                 "tools/" + std::to_string(out.wire_tools.size()) + "/parameters")));
             continue;
         }
+        if (type == "custom") {
+            // A custom tool has no NInfer executor; lower it to the function schema the Engine
+            // can call, remembering it so the response re-emits a `custom_tool_call` Item.
+            ParsedFunctionTool parsed = parse_function_tool(
+                item, std::nullopt, {}, out.tool_identities,
+                "tools/" + std::to_string(out.wire_tools.size()) + "/input_schema",
+                /*is_custom=*/true);
+            out.custom_tool_names.insert(parsed.engine_name);
+            out.wire_tools.push_back(append_function(std::move(parsed)));
+            continue;
+        }
         if (type != "namespace") {
-            bad_request("tool type '" + type +
-                            "' requires an executor that NInfer does not provide",
-                        "tools", "tool_type_not_supported");
+            // Any other tool type (Codex `web_search`, `tool_search`, ...) is a client-side tool
+            // NInfer does not execute. Lower its identity and, when present, its `parameters`
+            // schema so the Engine can still propose a call the client runs, and re-emit the item
+            // verbatim so the response round-trips the tool unchanged. These tools carry no
+            // `name` (they are identified by `type`), so fall back to the type. The remaining
+            // members (for example `execution` or `external_web_access`) are client-only and
+            // ignored.
+            std::string name;
+            if (item.contains("name") && !item.at("name").is_null()) {
+                if (!item.at("name").is_string()) {
+                    bad_request("tool name must be a string", "tools");
+                }
+                name = item.at("name").get<std::string>();
+            } else {
+                name = type;
+            }
+            if (!valid_tool_name(name, 64)) {
+                bad_request("client tool name must match [A-Za-z0-9_-]{1,64}", "tools",
+                            "invalid_tool_name");
+            }
+            ToolDefinition definition;
+            definition.name = name;
+            if (item.contains("parameters") && !item.at("parameters").is_null()) {
+                if (!item.at("parameters").is_object()) {
+                    bad_request("tool parameters must be a JSON object", "tools");
+                }
+                definition.schema_param      =
+                    "tools/" + std::to_string(out.wire_tools.size()) + "/parameters";
+                definition.input_schema_json = item.at("parameters").dump();
+            } else {
+                definition.schema_param = "";
+                const Json empty_object_schema = {{"type", "object"},
+                                                  {"properties", Json::object()}};
+                definition.input_schema_json   = empty_object_schema.dump();
+            }
+            const OpenAIResponsesFunctionIdentity identity{
+                .name = name, .wire_namespace = std::nullopt};
+            definition.name = lower_function_identity(identity, out.tool_identities, "tools");
+            ParsedFunctionTool parsed;
+            parsed.definition  = std::move(definition);
+            parsed.canonical   = item; // verbatim round-trip of the client tool
+            parsed.engine_name = name;
+            out.wire_tools.push_back(append_function(std::move(parsed)));
+            continue;
         }
 
         // OpenAI Responses beta groups functions/custom tools under a namespace. NInfer lowers
@@ -963,9 +1127,11 @@ void parse_text(const Json& body, GenerationRequest& request) {
             bad_request("text.verbosity must be a string", "text");
         }
         const std::string verbosity = text.at("verbosity").get<std::string>();
-        if (verbosity != "medium") {
-            bad_request("text.verbosity '" + verbosity + "' cannot be enforced by the Engine",
-                        "text", "verbosity_not_supported");
+        // Verbosity is a soft output-style hint the Engine does not enforce. Accept the OpenAI
+        // enum so protocol-compatible clients (e.g. Codex sends `low`) round-trip, and ignore it.
+        if (verbosity != "low" && verbosity != "medium" && verbosity != "high") {
+            bad_request("text.verbosity must be one of low, medium, or high", "text",
+                        "verbosity_not_supported");
         }
     }
 }
@@ -1165,7 +1331,8 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
         out.text_format = body["text"]["format"];
     out.tools               = std::move(parsed.wire_tools);
     out.tool_choice         = std::move(parsed.wire_tool_choice);
-    out.tool_identities     = std::move(parsed.tool_identities);
+    out.tool_identities            = std::move(parsed.tool_identities);
+    out.custom_tool_engine_names   = std::move(parsed.custom_tool_names);
     out.parallel_tool_calls = parsed.parallel_tool_calls;
     out.store               = optional_bool(body, "store", true);
     out.stream              = optional_bool(body, "stream", false);
@@ -1189,10 +1356,13 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
     }
     if (body.contains("include") && !body.at("include").is_null()) {
         if (!body.at("include").is_array()) { bad_request("include must be an array", "include"); }
-        if (!body.at("include").empty()) {
-            bad_request("the requested additional response fields have no available response "
-                        "representation",
-                        "include", "include_not_supported");
+        // NInfer's generation response has a fixed field set; no `include` value (for example
+        // Codex's `reasoning.encrypted_content`) changes it, so the request is accepted and the
+        // unavailable fields are simply omitted. Entries must be strings.
+        for (const Json& entry : body.at("include")) {
+            if (!entry.is_string()) {
+                bad_request("include entries must be strings", "include", "invalid_type");
+            }
         }
     }
     if (body.contains("stream_options") && !body.at("stream_options").is_null()) {

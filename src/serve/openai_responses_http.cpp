@@ -12,7 +12,9 @@
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
+#include <iostream>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -156,7 +158,9 @@ void redact_input_image_urls(Json& item) {
         }
     };
     if (item.contains("content")) { redact_parts(item["content"]); }
-    if (item.value("type", "") == "function_call_output" && item.contains("output")) {
+    if ((item.value("type", "") == "function_call_output" ||
+         item.value("type", "") == "custom_tool_call_output") &&
+        item.contains("output")) {
         redact_parts(item["output"]);
     }
 }
@@ -245,7 +249,13 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
-        request = parse_openai_responses_create_request(parse_json_body(req), limits);
+        const RequestJson body = parse_json_body(req);
+        if (std::getenv("NINFER_DUMP_TOOLS") != nullptr) {
+            // Opt-in diagnostic: dump the raw request so the exact `tools` (and any other)
+            // members a client sends can be inspected before the allow-list rejection.
+            std::cerr << "[NINFER_DUMP_TOOLS] " << body.dump() << "\n" << std::flush;
+        }
+        request = parse_openai_responses_create_request(body, limits);
         validate_openai_model(request.prompt.model, public_model_id_);
         resolved = resolve_openai_responses_prompt(request.prompt, openai_responses_store_, id,
                                                    request.store);

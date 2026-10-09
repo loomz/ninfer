@@ -541,7 +541,8 @@ wire response contains typed `output` Items.
 | `chat_template_kwargs` | template parameters as a JSON object; standard options merge with typed fields |
 | `preserve_thinking` | alias for `chat_template_kwargs.preserve_thinking`; conflicting values are rejected |
 | `text.format` | `text` (default), `json_object`, or `json_schema`; see output constraints above |
-| `tools` | direct function definitions or namespace groups containing function definitions; see below |
+| `text.verbosity` | omitted or `low`, `medium`, `high`; a soft output-style hint the Engine does not enforce, so it is accepted and ignored |
+| `tools` | direct function, custom, or client-side tool definitions, or namespace groups containing them; see below |
 | `tool_choice` | `auto`, `none`, `required`, a named function, or function-only `allowed_tools` with mode `auto`/`required`; namespaced selection carries both `namespace` and `name` |
 | `parallel_tool_calls` | `true` by default; `false` enforces at most one call |
 | `max_tool_calls` | non-negative integer accepted as a hosted-tool no-op; NInfer does not execute hosted tools |
@@ -549,7 +550,7 @@ wire response contains typed `output` Items.
 | `top_logprobs` | omitted or `0` |
 | `service_tier` | omitted, `auto`, or `default`; the response reports `default` |
 | `background` | omitted or `false` |
-| `include` | omitted or an empty array |
+| `include` | omitted or an array of strings; fields NInfer does not represent (for example `reasoning.encrypted_content`) are simply omitted from the response |
 | `stream_options.include_obfuscation` | optional boolean; accepted as a transport hint, but this local server emits no padding |
 | cache and client hints | `prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention`, and explicit breakpoints follow [OpenAI prompt caching](#openai-prompt-caching); `safety_identifier` and `user` are accepted as client hints |
 
@@ -638,8 +639,15 @@ NInfer renders these definitions in the Qwen prompt and parses model output into
 `call_id` (`call_...`). The client executes the function and sends a `function_call_output` Item in
 a later request. Selection and strict argument enforcement follow the common tool contract above.
 
-Hosted tools, remote MCP tools, custom free-form tools, deferred loading, output schemas, and
-caller restrictions that exclude direct invocation remain unsupported.
+Custom free-form tools are accepted: NInfer lowers them to Engine function calls (using their
+`input_schema` when present, or an empty schema otherwise) and re-emits each call as a
+`custom_tool_call` Item with a raw `input` string, so the client executes the free-form result.
+Any other tool type NInfer does not execute (for example OpenAI `web_search` or `tool_search`,
+which carry no `name` and are identified by their `type`) is likewise lowered to a callable
+function and re-emitted verbatim in the response for the client to run. A client tool's client-only
+members (`format`, `execution`, `external_web_access`, ...) are ignored. OpenAI-hosted and remote
+MCP executors, deferred loading, output schemas, and caller restrictions that exclude direct
+invocation remain unsupported.
 
 ### Response object and usage
 
@@ -757,9 +765,10 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 ```
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
-moderation, non-empty `include`, background execution, compaction,
-files/audio, and OpenAI-hosted/MCP/custom tools. These are compatibility boundaries, not silently
-accepted placeholders.
+moderation, background execution, compaction, and files/audio. A non-empty `include` is accepted
+with the requested fields omitted, and custom or client-side tools are lowered and re-emitted for
+the client to execute; OpenAI-hosted and remote MCP executors remain unavailable. These are
+compatibility boundaries, not silently accepted placeholders.
 
 ## Anthropic Messages
 
